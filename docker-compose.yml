@@ -1,0 +1,289 @@
+version: '3.9'
+
+services:
+  # ========================
+  # Infrastructure Layer
+  # ========================
+  
+  postgres:
+    image: postgres:16-alpine
+    container_name: nexus-postgres
+    environment:
+      POSTGRES_DB: nexusdb
+      POSTGRES_USER: nexus_user
+      POSTGRES_PASSWORD: nexus_secure_password_2025
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus_user -d nexusdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  mongodb:
+    image: mongo:7
+    container_name: nexus-mongodb
+    environment:
+      MONGO_INITDB_DATABASE: nexus_audit
+      MONGO_INITDB_ROOT_USERNAME: nexus_user
+      MONGO_INITDB_ROOT_PASSWORD: nexus_secure_password_2025
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh mongodb://nexus_user:nexus_secure_password_2025@localhost:27017/ --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: nexus-redis
+    command: redis-server --requirepass nexus_redis_password --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: nexus-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: nexus_user
+      RABBITMQ_DEFAULT_PASS: nexus_rabbit_password
+      RABBITMQ_ERLANG_COOKIE: secret_cookie_2025
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nexus-network
+
+  qdrant:
+    image: qdrant/qdrant:v1.10.0
+    container_name: nexus-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - nexus-network
+
+  # ========================
+  # Microservices Layer
+  # ========================
+
+  auth-service:
+    build:
+      context: ./backend/auth-service
+      dockerfile: Dockerfile
+    container_name: nexus-auth-service
+    ports:
+      - "8001:8001"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://nexus_user:nexus_secure_password_2025@postgres:5432/nexusdb
+      - REDIS_URL=redis://:nexus_redis_password@redis:6379/0
+      - RABBITMQ_URL=amqp://nexus_user:nexus_rabbit_password@rabbitmq:5672/
+      - JWT_SECRET=super-secret-jwt-key-change-in-production-2025
+      - JWT_ALGORITHM=HS256
+      - ACCESS_TOKEN_EXPIRE_MINUTES=30
+      - REFRESH_TOKEN_EXPIRE_DAYS=7
+      - SERVICE_NAME=auth-service
+      - LOG_LEVEL=INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - nexus-network
+    restart: unless-stopped
+
+  user-service:
+    build:
+      context: ./backend/user-service
+      dockerfile: Dockerfile
+    container_name: nexus-user-service
+    ports:
+      - "8002:8002"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://nexus_user:nexus_secure_password_2025@postgres:5432/nexusdb
+      - REDIS_URL=redis://:nexus_redis_password@redis:6379/0
+      - RABBITMQ_URL=amqp://nexus_user:nexus_rabbit_password@rabbitmq:5672/
+      - JWT_SECRET=super-secret-jwt-key-change-in-production-2025
+      - SERVICE_NAME=user-service
+      - LOG_LEVEL=INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - nexus-network
+    restart: unless-stopped
+
+  role-service:
+    build:
+      context: ./backend/role-service
+      dockerfile: Dockerfile
+    container_name: nexus-role-service
+    ports:
+      - "8003:8003"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://nexus_user:nexus_secure_password_2025@postgres:5432/nexusdb
+      - RABBITMQ_URL=amqp://nexus_user:nexus_rabbit_password@rabbitmq:5672/
+      - JWT_SECRET=super-secret-jwt-key-change-in-production-2025
+      - SERVICE_NAME=role-service
+      - LOG_LEVEL=INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - nexus-network
+    restart: unless-stopped
+
+  audit-service:
+    build:
+      context: ./backend/audit-service
+      dockerfile: Dockerfile
+    container_name: nexus-audit-service
+    ports:
+      - "8004:8004"
+    environment:
+      - MONGODB_URL=mongodb://nexus_user:nexus_secure_password_2025@mongodb:27017/nexus_audit?authSource=admin
+      - RABBITMQ_URL=amqp://nexus_user:nexus_rabbit_password@rabbitmq:5672/
+      - SERVICE_NAME=audit-service
+      - LOG_LEVEL=INFO
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - nexus-network
+    restart: unless-stopped
+
+  ai-service:
+    build:
+      context: ./backend/ai-service
+      dockerfile: Dockerfile
+    container_name: nexus-ai-service
+    ports:
+      - "8005:8005"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://nexus_user:nexus_secure_password_2025@postgres:5432/nexusdb
+      - RABBITMQ_URL=amqp://nexus_user:nexus_rabbit_password@rabbitmq:5672/
+      - QDRANT_URL=http://qdrant:6333
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_MODEL=gpt-4o-mini
+      - SERVICE_NAME=ai-service
+      - LOG_LEVEL=INFO
+      - AUTH_SERVICE_URL=http://auth-service:8001
+      - USER_SERVICE_URL=http://user-service:8002
+    depends_on:
+      - qdrant
+      - postgres
+      - rabbitmq
+    networks:
+      - nexus-network
+    restart: unless-stopped
+
+  # ========================
+  # Frontend
+  # ========================
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: nexus-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_AUTH_SERVICE_URL=http://localhost:8001
+      - NEXT_PUBLIC_USER_SERVICE_URL=http://localhost:8002
+      - NEXT_PUBLIC_ROLE_SERVICE_URL=http://localhost:8003
+      - NEXT_PUBLIC_AUDIT_SERVICE_URL=http://localhost:8004
+      - NEXT_PUBLIC_AI_SERVICE_URL=http://localhost:8005
+    depends_on:
+      - auth-service
+      - user-service
+      - role-service
+      - ai-service
+    networks:
+      - nexus-network
+    restart: unless-stopped
+
+  # ========================
+  # Monitoring (Optional)
+  # ========================
+  
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: nexus-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - nexus-network
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: nexus-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - nexus-network
+    profiles:
+      - monitoring
+
+volumes:
+  postgres_data:
+  mongodb_data:
+  redis_data:
+  rabbitmq_data:
+  qdrant_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  nexus-network:
+    driver: bridge
