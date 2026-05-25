@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   # ========================
   # Infrastructure Layer
@@ -199,19 +197,25 @@ services:
     ports:
       - "8005:8005"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://nexus_user:nexus_secure_password_2025@postgres:5432/nexusdb
-      - RABBITMQ_URL=amqp://nexus_user:nexus_rabbit_password@rabbitmq:5672/
+      - SERVICE_NAME=ai-service
+      - SERVICE_VERSION=2.0.0
+      - LOG_LEVEL=INFO
       - QDRANT_URL=http://qdrant:6333
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENAI_MODEL=gpt-4o-mini
-      - SERVICE_NAME=ai-service
-      - LOG_LEVEL=INFO
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
       - AUTH_SERVICE_URL=http://auth-service:8001
       - USER_SERVICE_URL=http://user-service:8002
+      - ROLE_SERVICE_URL=http://role-service:8003
+      - AUDIT_SERVICE_URL=http://audit-service:8004
     depends_on:
-      - qdrant
-      - postgres
-      - rabbitmq
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
     networks:
       - nexus-network
     restart: unless-stopped

@@ -1,7 +1,7 @@
 """Auth Service - Domain Entities."""
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -43,8 +43,8 @@ class AuthUser:
         self.updated_at = datetime.now(timezone.utc)
 
         if self.failed_attempts >= max_attempts:
-            self.locked_until = datetime.now(timezone.utc).replace(
-                minute=datetime.now(timezone.utc).minute + lockout_minutes
+            self.locked_until = datetime.now(timezone.utc) + timedelta(
+                minutes=lockout_minutes
             )
 
     def is_locked(self) -> bool:
@@ -72,9 +72,7 @@ class RefreshToken:
             id=uuid4(),
             user_id=user_id,
             token_hash=token_hash,
-            expires_at=datetime.now(timezone.utc).replace(
-                day=datetime.now(timezone.utc).day + expires_in_days
-            ),
+            expires_at=datetime.now(timezone.utc) + timedelta(days=expires_in_days),
         )
 
     def is_expired(self) -> bool:

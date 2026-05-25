@@ -31,6 +31,11 @@ async def list_roles():
     return await svc.get_all_roles()
 
 
+@router.get("/health")
+async def health():
+    return {"status": "healthy", "service": "role-service", "version": "1.0.0"}
+
+
 @router.get("/{role_id}", response_model=RoleResponse)
 async def get_role(role_id: UUID):
     svc = get_role_service()
@@ -57,8 +62,3 @@ async def revoke_role(role_id: UUID, user_id: UUID):
 async def get_user_permissions(user_id: UUID):
     svc = get_role_service()
     return await svc.get_user_permissions(user_id)
-
-
-@router.get("/health")
-async def health():
-    return {"status": "healthy", "service": "role-service", "version": "1.0.0"}

@@ -1,58 +1,77 @@
-"""AI Service - RAG Agent with OpenAI and Qdrant."""
-import os, json, logging, time
+"""AI Service - RAG + LangGraph Agent + MCP Server.
+
+Architecture:
+- app/rag.py: RAG pipeline (embeddings, vector store, prompt engineering)
+- app/tools.py: Function calling tools for agent (9 tools across 4 microservices)
+- app/agent.py: LangGraph multi-step agent with state graph
+- app/mcp_server.py: Model Context Protocol server for external AI agents
+- app/main.py: FastAPI application, DI, routing, and configuration
+"""
+import logging
+import time
 from contextlib import asynccontextmanager
-from typing import Optional, List
-from datetime import datetime
-from fastapi import FastAPI, Request, HTTPException, status, Query
+from typing import Optional, List, Dict, Any
+
+from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-import httpx
 
+from app.rag import VectorStoreManager, OpenAIHelper, RAGPipeline
+from app.mcp_server import handle_mcp_request
+
+
+# ─────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────
 
 class Settings(BaseSettings):
+    """AI Service configuration, loaded from environment variables."""
     service_name: str = "ai-service"
-    service_version: str = "1.0.0"
+    service_version: str = "2.0.0"
     log_level: str = "INFO"
-    database_url: str = "postgresql+asyncpg://nexus_user:nexus_secure_password_2025@localhost:5432/nexusdb"
-    rabbitmq_url: str = "amqp://nexus_user:nexus_rabbit_password@localhost:5672/"
     qdrant_url: str = "http://localhost:6333"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     auth_service_url: str = "http://localhost:8001"
     user_service_url: str = "http://localhost:8002"
+    role_service_url: str = "http://localhost:8003"
+    audit_service_url: str = "http://localhost:8004"
     max_tokens: int = 1000
     temperature: float = 0.3
-    class Config: env_file = ".env"; extra = "ignore"
+    max_agent_tool_calls: int = 10
+
+    class Config:
+        env_file = ".env"
+        extra = "ignore"
 
 settings = Settings()
 
-# Setup logging
-logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+# Setup structured logging
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger(settings.service_name)
 
-# Global clients
-openai_client = None
-qdrant_client = None
 
+# ─────────────────────────────────────────────────────────
+# Pydantic Schemas
+# ─────────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
-    user_id: Optional[str] = None
     collection: str = "nexus_documents"
-
 
 class DocumentIngestRequest(BaseModel):
     documents: List[dict] = Field(..., description="List of documents with id, content, metadata")
     collection: str = "nexus_documents"
 
-
 class AIResponse(BaseModel):
     answer: str
     sources: List[dict] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
-
 
 class QueryEvaluation(BaseModel):
     response: str
@@ -63,222 +82,331 @@ class QueryEvaluation(BaseModel):
     cost_usd: float
     source_count: int
 
+class AgentRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=4000)
+    conversation_history: Optional[List[Dict[str, str]]] = Field(
+        None,
+        description='Previous messages: [{"role": "user"|"assistant", "content": "..."}]',
+    )
 
-class VectorStoreManager:
-    def __init__(self, qdrant_url: str):
-        self.qdrant_url = qdrant_url
-        self.collections = {}
+class AgentResponse(BaseModel):
+    answer: str
+    tool_calls: int = 0
+    trace: List[dict] = Field(default_factory=list)
+    latency_ms: float = 0.0
+    metadata: dict = Field(default_factory=dict)
 
-    async def ensure_collection(self, collection_name: str, vector_size: int = 1536):
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{self.qdrant_url}/collections/{collection_name}")
-            if resp.status_code == 200:
-                return
-            create_data = {"name": collection_name, "vectors": {"size": vector_size, "distance": "Cosine"}}
-            resp = await client.put(f"{self.qdrant_url}/collections/{collection_name}", json=create_data)
-            if resp.status_code == 200:
-                logger.info(f"Created collection: {collection_name}")
+class MCPRequest(BaseModel):
+    type: str = Field(..., description="list_tools | call_tool | list_resources | read_resource")
+    params: dict = Field(default_factory=dict)
 
-    async def upsert_points(self, collection_name: str, points: List[dict]):
-        async with httpx.AsyncClient() as client:
-            resp = await client.put(f"{self.qdrant_url}/collections/{collection_name}/points", json={"points": points})
-            return resp.status_code == 200
-
-    async def search(self, collection_name: str, query_vector: List[float], limit: int = 5) -> List[dict]:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{self.qdrant_url}/collections/{collection_name}/points/search",
-                json={"vector": query_vector, "limit": limit, "with_payload": True},
-            )
-            if resp.status_code != 200: return []
-            data = resp.json()
-            return [{"id": r["id"], "score": r["score"], "payload": r.get("payload", {})} for r in data.get("result", [])]
+class MCPResponse(BaseModel):
+    type: str
+    tools: Optional[List[dict]] = None
+    resources: Optional[List[dict]] = None
+    content: Optional[List[dict]] = None
+    error: Optional[str] = None
 
 
-class OpenAIHelper:
-    def __init__(self, api_key: str, model: str):
-        self.api_key = api_key
-        self.model = model
-        self.base_url = "https://api.openai.com/v1"
+# ─────────────────────────────────────────────────────────
+# Dependency Injection Container
+# ─────────────────────────────────────────────────────────
 
-    async def create_embeddings(self, texts: List[str]) -> Optional[List[List[float]]]:
-        if not self.api_key:
-            logger.warning("OpenAI API key not set - returning mock embeddings")
-            return [[0.0] * 1536 for _ in texts]
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{self.base_url}/embeddings",
-                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                json={"model": "text-embedding-ada-002", "input": texts},
-                timeout=30.0,
-            )
-            if resp.status_code != 200: logger.error(f"OpenAI embeddings error: {resp.text}"); return None
-            data = resp.json()
-            return [item["embedding"] for item in data["data"]]
+class Container:
+    """Holds service instances initialized at startup."""
+    rag_pipeline: Optional[RAGPipeline] = None
+    agent: Optional[Any] = None
+    settings: Settings = settings
 
-    async def chat_completion(self, messages: List[dict], max_tokens: int = 1000, temperature: float = 0.3) -> Optional[dict]:
-        if not self.api_key:
-            return {"content": "OpenAI API key not configured. This is a mock response.", "total_tokens": 0, "prompt_tokens": 0, "completion_tokens": 0}
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                json={"model": self.model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature},
-                timeout=60.0,
-            )
-            if resp.status_code != 200: logger.error(f"OpenAI chat error: {resp.text}"); return None
-            data = resp.json()
-            choice = data["choices"][0]
-            usage = data.get("usage", {})
-            return {"content": choice["message"]["content"], "total_tokens": usage.get("total_tokens", 0),
-                    "prompt_tokens": usage.get("prompt_tokens", 0), "completion_tokens": usage.get("completion_tokens", 0)}
+_container = Container()
 
 
-SYSTEM_PROMPT = """You are a helpful AI assistant for the Nexus User Management System. 
-You help users understand and interact with the system's data.
-
-Guidelines:
-1. Always respond in a clear, professional manner
-2. Use the provided context to answer questions accurately
-3. If you don't have enough information, say so honestly
-4. Do not invent or hallucinate information not present in the context
-5. When discussing user data, respect privacy and security
-6. Keep responses concise and actionable
-"""
-
-FEW_SHOT_EXAMPLES = """
-Example 1:
-User: How many users are in the system?
-Assistant: Based on the system data, the user management system tracks user profiles. 
-You can query user statistics through the User Service API.
-
-Example 2:
-User: What can you help me with?
-Assistant: I can help you with:
-- Answering questions about system users and data
-- Generating reports from user information
-- Explaining system features and capabilities
-- Analyzing user patterns and trends
-"""
+def _init_agent():
+    """Lazy initialization of the LangGraph agent."""
+    if _container.agent is None and settings.openai_api_key:
+        from app.agent import NexusAgent
+        _container.agent = NexusAgent(
+            openai_api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            max_tool_calls=settings.max_agent_tool_calls,
+        )
+        logger.info("LangGraph NexusAgent initialized")
+    return _container.agent
 
 
-def build_rag_prompt(question: str, context_chunks: List[str]) -> List[dict]:
-    context = "\n\n".join([f"Context {i+1}: {chunk}" for i, chunk in enumerate(context_chunks)])
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "system", "content": FEW_SHOT_EXAMPLES},
-        {"role": "user", "content": f"Context information:\n{context}\n\nQuestion: {question}\n\nAnswer based on the context provided."}
-    ]
-
-
-MODEL_COST_PER_1K = {
-    "gpt-4o-mini": {"input": 0.00015, "output": 0.00060},
-    "gpt-4o": {"input": 0.0025, "output": 0.010},
-    "gpt-4": {"input": 0.03, "output": 0.06},
-    "text-embedding-ada-002": {"input": 0.0001, "output": 0.0001},
-}
-
-def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    costs = MODEL_COST_PER_1K.get(model, MODEL_COST_PER_1K["gpt-4o-mini"])
-    return round((input_tokens / 1000) * costs["input"] + (output_tokens / 1000) * costs["output"], 6)
-
-
-vector_store: Optional[VectorStoreManager] = None
-openai_helper: Optional[OpenAIHelper] = None
-
+# ─────────────────────────────────────────────────────────
+# Application Lifespan
+# ─────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global vector_store, openai_helper
-    logger.info("Starting AI Service")
-    vector_store = VectorStoreManager(settings.qdrant_url)
-    openai_helper = OpenAIHelper(settings.openai_api_key, settings.openai_model)
+    """Startup: initialize services. Shutdown: clean up resources."""
+    logger.info(f"Starting {settings.service_name} v{settings.service_version}")
+
+    # Initialize RAG pipeline
     try:
+        vector_store = VectorStoreManager(settings.qdrant_url)
+        openai_helper = OpenAIHelper(settings.openai_api_key, settings.openai_model)
         await vector_store.ensure_collection("nexus_documents")
+        _container.rag_pipeline = RAGPipeline(
+            vector_store=vector_store,
+            openai_helper=openai_helper,
+            model=settings.openai_model,
+        )
+        logger.info("RAG pipeline initialized")
     except Exception as e:
-        logger.warning(f"Could not create Qdrant collection: {e}")
-    logger.info(f"AI Service started (model: {settings.openai_model})")
+        logger.warning(f"RAG initialization incomplete: {e}")
+
+    # Pre-initialize agent if API key available
+    if settings.openai_api_key:
+        _init_agent()
+
+    logger.info(f"{settings.service_name} started (model: {settings.openai_model})")
     yield
-    logger.info("AI Service stopped")
+    logger.info(f"{settings.service_name} stopped")
 
 
-app = FastAPI(title="Nexus AI Service", description="AI Agent with RAG", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(
+    title="Nexus AI Service",
+    description="AI Agent with RAG + LangGraph Agent + MCP Server",
+    version=settings.service_version,
+    lifespan=lifespan,
+    docs_url="/docs",
+)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────────────────
+# Exception Handlers
+# ─────────────────────────────────────────────────────────
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(
+        "Unhandled exception",
+        extra={"path": str(request.url), "method": request.method, "error": str(exc)},
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred", "error_code": "INTERNAL_ERROR"},
+    )
+
+
+# ─────────────────────────────────────────────────────────
+# RAG Endpoints
+# ─────────────────────────────────────────────────────────
 
 @app.post("/api/v1/ai/query", response_model=AIResponse)
-async def query_ai(request: QueryRequest):
-    if not vector_store or not openai_helper:
-        raise HTTPException(status_code=503, detail="AI Service not fully initialized")
-    start_time = time.time()
+async def query_rag(request: QueryRequest):
+    """RAG query: search vector DB for context and generate AI response."""
+    pipeline = _container.rag_pipeline
+    if not pipeline:
+        raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
+
     try:
-        question_embedding = await openai_helper.create_embeddings([request.question])
-        if not question_embedding: raise HTTPException(status_code=500, detail="Failed to create embedding")
-        search_results = await vector_store.search(request.collection, question_embedding[0], limit=5)
-        context_chunks = [r["payload"].get("content", "") for r in search_results if r.get("payload", {}).get("content")]
-        messages = build_rag_prompt(request.question, context_chunks)
-        completion = await openai_helper.chat_completion(messages, max_tokens=settings.max_tokens, temperature=settings.temperature)
-        if not completion: raise HTTPException(status_code=500, detail="Failed to get AI completion")
-        elapsed_ms = (time.time() - start_time) * 1000
-        cost = calculate_cost(settings.openai_model, completion.get("prompt_tokens", 0), completion.get("completion_tokens", 0))
-        logger.info(f"AI query completed", extra={"latency_ms": round(elapsed_ms, 2), "tokens": completion.get("total_tokens", 0), "cost": cost})
-        sources = [{"id": r["id"], "score": r["score"], "title": r["payload"].get("title", "")} for r in search_results[:3]]
-        return AIResponse(answer=completion["content"], sources=sources, metadata={
-            "model": settings.openai_model, "latency_ms": round(elapsed_ms, 2),
-            "total_tokens": completion.get("total_tokens", 0), "cost_usd": cost,
-        })
-    except HTTPException: raise
-    except Exception as e:
-        logger.error(f"AI query error: {e}")
+        result = await pipeline.query(
+            question=request.question,
+            collection=request.collection,
+        )
+        return AIResponse(**result)
+    except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"RAG query error: {e}")
+        raise HTTPException(status_code=500, detail="RAG query failed")
 
 
 @app.post("/api/v1/ai/ingest")
 async def ingest_documents(request: DocumentIngestRequest):
-    if not vector_store or not openai_helper:
-        raise HTTPException(status_code=503, detail="AI Service not fully initialized")
+    """Ingest documents into Qdrant vector database."""
+    pipeline = _container.rag_pipeline
+    if not pipeline:
+        raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
+
     try:
-        await vector_store.ensure_collection(request.collection)
-        texts = [doc.get("content", "") for doc in request.documents]
-        embeddings = await openai_helper.create_embeddings(texts)
-        if not embeddings: raise HTTPException(status_code=500, detail="Failed to create embeddings")
-        points = [{"id": doc.get("id", i), "vector": embedding,
-                    "payload": {"title": doc.get("title", ""), "content": doc.get("content", ""),
-                               "metadata": doc.get("metadata", {}), "timestamp": datetime.utcnow().isoformat()}}
-                  for i, (doc, embedding) in enumerate(zip(request.documents, embeddings))]
-        success = await vector_store.upsert_points(request.collection, points)
-        if not success: raise HTTPException(status_code=500, detail="Failed to store documents")
-        return {"message": f"Successfully ingested {len(points)} documents", "collection": request.collection}
-    except HTTPException: raise
+        result = await pipeline.ingest(
+            documents=request.documents,
+            collection=request.collection,
+        )
+        return result
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         logger.error(f"Ingest error: {e}")
+        raise HTTPException(status_code=500, detail="Document ingestion failed")
+
+
+@app.post("/api/v1/ai/evaluate", response_model=QueryEvaluation)
+async def evaluate_rag_query(request: QueryRequest):
+    """Evaluate a RAG query with detailed metrics (latency, tokens, cost)."""
+    pipeline = _container.rag_pipeline
+    if not pipeline:
+        raise HTTPException(status_code=503, detail="RAG pipeline not initialized")
+
+    try:
+        result = await pipeline.evaluate(
+            question=request.question,
+            collection=request.collection,
+        )
+        return QueryEvaluation(**result)
+    except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"Evaluate error: {e}")
+        raise HTTPException(status_code=500, detail="Evaluation failed")
 
 
-@app.post("/api/v1/ai/evaluate")
-async def evaluate_query(request: QueryRequest):
-    start_time = time.time()
-    if not vector_store or not openai_helper:
-        raise HTTPException(status_code=503, detail="AI Service not initialized")
-    emb = await openai_helper.create_embeddings([request.question])
-    embedding = emb[0] if emb else [0.0] * 1536
-    results = await vector_store.search(request.collection, embedding, limit=3)
-    contexts = [r["payload"].get("content", "") for r in results if r.get("payload")]
-    messages = build_rag_prompt(request.question, contexts)
-    completion = await openai_helper.chat_completion(messages, max_tokens=settings.max_tokens, temperature=settings.temperature)
-    elapsed_ms = (time.time() - start_time) * 1000
-    if not completion: raise HTTPException(status_code=500, detail="Failed to get completion")
-    cost = calculate_cost(settings.openai_model, completion.get("prompt_tokens", 0), completion.get("completion_tokens", 0))
-    return QueryEvaluation(response=completion["content"], latency_ms=round(elapsed_ms, 2),
-                          total_tokens=completion.get("total_tokens", 0), input_tokens=completion.get("prompt_tokens", 0),
-                          output_tokens=completion.get("completion_tokens", 0), cost_usd=cost, source_count=len(results))
+# ─────────────────────────────────────────────────────────
+# LangGraph Agent Endpoint
+# ─────────────────────────────────────────────────────────
 
+@app.post("/api/v1/ai/agent", response_model=AgentResponse)
+async def run_agent(request: AgentRequest):
+    """Run the LangGraph multi-step agent that orchestrates calls across all microservices.
+
+    The agent uses function calling to decide which tools to call based on the query:
+    - User profiles, search, listing
+    - Roles and permissions
+    - Audit logs and statistics
+    - RAG knowledge base queries
+
+    Example queries:
+    - "Show me all users and their roles"
+    - "What permissions does user X have?"
+    - "Show me recent audit logs for login events"
+    - "How many users are registered and what roles exist?"
+    """
+    agent = _init_agent()
+    if not agent:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Agent not available. "
+                "Set the OPENAI_API_KEY environment variable and restart the service."
+            ),
+        )
+
+    try:
+        start_time = time.time()
+        result = await agent.run(
+            query=request.query,
+            conversation_history=request.conversation_history,
+        )
+        return AgentResponse(
+            answer=result["answer"],
+            tool_calls=result["tool_calls"],
+            trace=result["trace"],
+            latency_ms=result["latency_ms"],
+            metadata=result["metadata"],
+        )
+    except Exception as e:
+        logger.error(f"Agent execution error: {e}")
+        raise HTTPException(status_code=500, detail=f"Agent execution failed: {str(e)}")
+
+
+# ─────────────────────────────────────────────────────────
+# MCP Protocol Endpoints
+# ─────────────────────────────────────────────────────────
+
+@app.post("/api/v1/ai/mcp", response_model=MCPResponse)
+async def mcp_handler(request: MCPRequest):
+    """Model Context Protocol (MCP) endpoint for external AI agents.
+
+    Allows tools like Claude Code, Cursor, etc. to discover and call Nexus system tools.
+
+    Request types:
+    - list_tools: List all tools with JSON schemas
+    - call_tool: Execute a tool by name with arguments
+    - list_resources: List available system resources
+    - read_resource: Read a resource by URI (e.g., nexus://system/status)
+
+    Examples:
+    ```json
+    {"type": "list_tools", "params": {}}
+    {"type": "call_tool", "params": {"name": "list_users", "arguments": {}}}
+    {"type": "read_resource", "params": {"uri": "nexus://system/status"}}
+    ```
+    """
+    try:
+        result = await handle_mcp_request({
+            "type": request.type,
+            "params": request.params,
+        })
+        return MCPResponse(**result)
+    except Exception as e:
+        logger.error(f"MCP error: {e}")
+        return MCPResponse(type="error", error=str(e))
+
+
+@app.get("/api/v1/ai/mcp/config")
+async def mcp_config():
+    """Get MCP server configuration for external agent registration."""
+    tools = [
+        {"name": "get_user_profile", "description": "Get a user's profile by their user ID"},
+        {"name": "list_users", "description": "List all user profiles in the system"},
+        {"name": "search_users", "description": "Search for users by name or department"},
+        {"name": "list_roles", "description": "List all roles and their permissions"},
+        {"name": "get_user_permissions", "description": "Get permissions for a specific user"},
+        {"name": "get_audit_logs", "description": "Retrieve audit log entries with filters"},
+        {"name": "get_audit_stats", "description": "Get aggregated audit event statistics"},
+        {"name": "query_rag", "description": "Query the RAG system with a question"},
+        {"name": "ingest_document", "description": "Ingest a document into the vector database"},
+    ]
+    return {
+        "name": "nexus-ai-service",
+        "version": settings.service_version,
+        "description": "Nexus System MCP Server - Access users, roles, audit logs, and RAG knowledge base",
+        "endpoint": "/api/v1/ai/mcp",
+        "protocol": "mcp",
+        "config_url": "/api/v1/ai/mcp",
+        "tools": tools,
+    }
+
+
+# ─────────────────────────────────────────────────────────
+# Health Check
+# ─────────────────────────────────────────────────────────
 
 @app.get("/api/v1/ai/health")
 async def health():
-    return {"status": "healthy", "service": "ai-service", "version": "1.0.0", "model": settings.openai_model, "qdrant": settings.qdrant_url}
+    """Health check endpoint returning service status and available capabilities."""
+    return {
+        "status": "healthy",
+        "service": settings.service_name,
+        "version": settings.service_version,
+        "model": settings.openai_model,
+        "qdrant": settings.qdrant_url,
+        "agent_available": _init_agent() is not None,
+        "rag_available": _container.rag_pipeline is not None,
+        "capabilities": {
+            "rag": True,
+            "agent": _init_agent() is not None,
+            "mcp": True,
+        },
+        "endpoints": {
+            "rag_query": "POST /api/v1/ai/query",
+            "rag_ingest": "POST /api/v1/ai/ingest",
+            "rag_evaluate": "POST /api/v1/ai/evaluate",
+            "agent": "POST /api/v1/ai/agent",
+            "mcp": "POST /api/v1/ai/mcp",
+            "mcp_config": "GET /api/v1/ai/mcp/config",
+        },
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8005, reload=True)
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8005,
+        reload=True,
+        log_level="info",
+    )
