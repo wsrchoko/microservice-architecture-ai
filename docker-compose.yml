@@ -196,6 +196,9 @@ services:
     container_name: nexus-ai-service
     ports:
       - "8005:8005"
+    volumes:
+      - ./backend/ai-service/app:/app/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8005", "--reload", "--log-level", "info"]
     environment:
       - SERVICE_NAME=ai-service
       - SERVICE_VERSION=2.0.0
